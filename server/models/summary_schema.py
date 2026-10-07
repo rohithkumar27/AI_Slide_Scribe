@@ -52,5 +52,5 @@ class ProcessSlideResponse(BaseModel):
     bounding_box: Optional[List[BoundingBoxPoint]] = None
     summary: Optional[GeminiSummary] = None
     slide_number: Optional[int] = None
-
+    session_id: Optional[str] = None
 
