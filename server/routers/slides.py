@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 from pydantic import BaseModel
 
 try:  # pragma: no cover - runtime dependency check
@@ -42,8 +42,10 @@ from server.models.summary_schema import (
 )
 from server.storage import (
     append_slide_history,
+    ensure_session,
     load_last_state,
     load_slide_history,
+    log_qa_turn,
     save_last_state,
 )
 
@@ -107,14 +109,15 @@ ACADEMIC_HINTS = {
 }
 
 
-_previous_text: Optional[str] = None
-_previous_clip_vec: Optional[np.ndarray] = None
-_state_initialized = False
-_conversation_memory: List[dict[str, str]] = []
+_previous_text_by_session: dict[str, Optional[str]] = {}
+_previous_clip_vec_by_session: dict[str, np.ndarray] = {}
+_initialized_sessions: set[str] = set()
+_conversation_memory_by_session: dict[str, List[dict[str, object]]] = {}
 
 
 class QuestionRequest(BaseModel):
     question: str
+    session_id: Optional[str] = None
     slide_summary: Optional[Dict[str, Any]] = None
 
 
@@ -124,34 +127,40 @@ def _corners_to_points(corners: Optional[np.ndarray]) -> Optional[List[BoundingB
     return [BoundingBoxPoint(x=int(point[0]), y=int(point[1])) for point in corners]
 
 
-def _ensure_previous_state_loaded() -> None:
-    global _state_initialized, _previous_clip_vec, _previous_text
-    if _state_initialized:
+def _ensure_previous_state_loaded(session_id: str) -> None:
+    if session_id in _initialized_sessions:
         return
-    state = load_last_state()
-    _previous_text = state.text
+    state = load_last_state(session_id=session_id)
+    _previous_text_by_session[session_id] = state.text
     if state.clip_vector is not None:
-        _previous_clip_vec = state.clip_vector.astype(np.float32)
-    _state_initialized = True
+        _previous_clip_vec_by_session[session_id] = state.clip_vector.astype(np.float32)
+    _initialized_sessions.add(session_id)
 
 
-def _record_conversation(question: str, answer: str, slide_number: int) -> None:
-    _conversation_memory.append(
+def _record_conversation(
+    session_id: str,
+    question: str,
+    answer: str,
+    slide_number: int,
+) -> None:
+    memory = _conversation_memory_by_session.setdefault(session_id, [])
+    memory.append(
         {
             "question": question.strip(),
             "answer": answer.strip(),
             "slide_number": slide_number,
         }
     )
-    if len(_conversation_memory) > MAX_CONVERSATION_MEMORY:
-        del _conversation_memory[:-MAX_CONVERSATION_MEMORY]
+    if len(memory) > MAX_CONVERSATION_MEMORY:
+        del memory[:-MAX_CONVERSATION_MEMORY]
 
 
-def _build_conversation_text() -> str:
-    if not _conversation_memory:
+def _build_conversation_text(session_id: str) -> str:
+    memory = _conversation_memory_by_session.get(session_id, [])
+    if not memory:
         return ""
     segments = []
-    for turn in _conversation_memory[-MAX_CONVERSATION_MEMORY:]:
+    for turn in memory[-MAX_CONVERSATION_MEMORY:]:
         segments.append(
             f"Slide {turn['slide_number']} - User: {turn['question']}\nAssistant: {turn['answer']}"
         )
@@ -254,11 +263,12 @@ def _select_relevant_slide_context(
 def _append_slide_history_entry(
     summary: Dict[str, Any],
     *,
+    session_id: str,
     ocr_text: str,
     text_similarity: Optional[float],
     clip_cosine: Optional[float],
 ) -> Dict[str, Any]:
-    history = load_slide_history()
+    history = load_slide_history(session_id=session_id)
     slide_number = history[-1]["slide_number"] + 1 if history else 1
     entry = {
         "slide_number": slide_number,
@@ -270,7 +280,7 @@ def _append_slide_history_entry(
             "clip_cosine": clip_cosine,
         },
     }
-    append_slide_history(entry)
+    append_slide_history(entry, session_id=session_id)
     return entry
 
 
@@ -333,26 +343,30 @@ def _process_frame(frame: np.ndarray) -> _SlideSample:
 def _determine_change(
     current_text: str,
     current_clip: np.ndarray,
+    *,
+    session_id: str,
 ) -> tuple[bool, Optional[float], Optional[float]]:
-    _ensure_previous_state_loaded()
+    _ensure_previous_state_loaded(session_id)
 
-    if _previous_text is None or _previous_clip_vec is None:
+    previous_text = _previous_text_by_session.get(session_id)
+    previous_clip = _previous_clip_vec_by_session.get(session_id)
+    if previous_text is None or previous_clip is None:
         return True, None, None
 
-    text_similarity = token_sort_ratio(current_text, _previous_text) / 100.0
-    clip_cosine = cosine_np(current_clip, _previous_clip_vec)
+    text_similarity = token_sort_ratio(current_text, previous_text) / 100.0
+    clip_cosine = cosine_np(current_clip, previous_clip)
     is_new = text_similarity < TEXT_THRESHOLD and clip_cosine < CLIP_THRESHOLD
     return is_new, text_similarity, clip_cosine
 
 
 def _update_memory(
     *,
+    session_id: str,
     text: str,
     clip_vector: np.ndarray,
 ) -> None:
-    global _previous_text, _previous_clip_vec
-    _previous_text = text
-    _previous_clip_vec = clip_vector
+    _previous_text_by_session[session_id] = text
+    _previous_clip_vec_by_session[session_id] = clip_vector
 
 
 @router.post(
@@ -360,7 +374,11 @@ def _update_memory(
     response_model=ProcessSlideResponse,
     summary="Process a slide image using CLIP and OCR similarity heuristics.",
 )
-async def process_slide(image: UploadFile = File(...)) -> ProcessSlideResponse:
+async def process_slide(
+    image: UploadFile = File(...),
+    session_id: Optional[str] = Form(None),
+) -> ProcessSlideResponse:
+    current_session_id = ensure_session(session_id)
     try:
         raw_bytes = await image.read()
         frame = decode_image(raw_bytes)
@@ -374,6 +392,7 @@ async def process_slide(image: UploadFile = File(...)) -> ProcessSlideResponse:
     is_new, text_similarity, clip_cosine = _determine_change(
         sample.ocr_text,
         sample.clip_vector,
+        session_id=current_session_id,
     )
 
     summary_payload = None
@@ -381,7 +400,8 @@ async def process_slide(image: UploadFile = File(...)) -> ProcessSlideResponse:
 
     if is_new:
         logger.info(
-            "New slide detected (text=%.3f, clip=%.3f); invoking Gemini.",
+            "New slide detected for session %s (text=%.3f, clip=%.3f); invoking Gemini.",
+            current_session_id,
             text_similarity if text_similarity is not None else -1.0,
             clip_cosine if clip_cosine is not None else -1.0,
         )
@@ -399,27 +419,34 @@ async def process_slide(image: UploadFile = File(...)) -> ProcessSlideResponse:
             summary=summary_payload,
             text=sample.ocr_text,
             clip_vector=sample.clip_vector,
+            session_id=current_session_id,
         )
-        _update_memory(text=sample.ocr_text, clip_vector=sample.clip_vector)
+        _update_memory(
+            session_id=current_session_id,
+            text=sample.ocr_text,
+            clip_vector=sample.clip_vector,
+        )
 
         if summary_payload is not None:
             history_entry = _append_slide_history_entry(
                 summary_payload,
+                session_id=current_session_id,
                 ocr_text=sample.ocr_text,
                 text_similarity=text_similarity,
                 clip_cosine=clip_cosine,
             )
             current_slide_number = history_entry["slide_number"]
         else:
-            history = load_slide_history()
+            history = load_slide_history(session_id=current_session_id)
             current_slide_number = (history[-1]["slide_number"] + 1) if history else 1
     else:
         logger.info(
-            "Slide unchanged (text=%.3f, clip=%.3f); reusing cached summary.",
+            "Slide unchanged for session %s (text=%.3f, clip=%.3f); reusing cached summary.",
+            current_session_id,
             text_similarity if text_similarity is not None else -1.0,
             clip_cosine if clip_cosine is not None else -1.0,
         )
-        state = load_last_state()
+        state = load_last_state(session_id=current_session_id)
         summary_payload = state.summary
         if summary_payload is None:
             logger.debug("No cached summary found; skipping summary payload.")
@@ -428,9 +455,14 @@ async def process_slide(image: UploadFile = File(...)) -> ProcessSlideResponse:
             summary=summary_payload,
             text=sample.ocr_text,
             clip_vector=sample.clip_vector,
+            session_id=current_session_id,
         )
-        _update_memory(text=sample.ocr_text, clip_vector=sample.clip_vector)
-        history = load_slide_history()
+        _update_memory(
+            session_id=current_session_id,
+            text=sample.ocr_text,
+            clip_vector=sample.clip_vector,
+        )
+        history = load_slide_history(session_id=current_session_id)
         if history:
             current_slide_number = history[-1]["slide_number"]
         else:
@@ -446,6 +478,7 @@ async def process_slide(image: UploadFile = File(...)) -> ProcessSlideResponse:
         bounding_box=sample.visual.bounding_box,
         summary=summary_model,
         slide_number=current_slide_number,
+        session_id=current_session_id,
     )
 
 
@@ -499,9 +532,13 @@ async def ask_question(payload: QuestionRequest) -> dict[str, object]:
             detail="Question cannot be empty.",
         )
 
-    history = load_slide_history()
+    current_session_id = ensure_session(payload.session_id)
+    history = load_slide_history(session_id=current_session_id)
     if not history:
-        return {"answer": "I don't have any slide context yet."}
+        return {
+            "answer": "I don't have any slide context yet.",
+            "session_id": current_session_id,
+        }
 
     current_entry = history[-1]
     slide_number = current_entry.get("slide_number", len(history))
@@ -525,6 +562,7 @@ async def ask_question(payload: QuestionRequest) -> dict[str, object]:
                 "answer": f"This question does not appear related to the lecture slide topic{hint}.",
                 "slide_number": slide_number,
                 "relevance": relevance,
+                "session_id": current_session_id,
             }
         else:
             logger.debug(
@@ -537,10 +575,10 @@ async def ask_question(payload: QuestionRequest) -> dict[str, object]:
     matched_slides = [
         entry.get("slide_number")
         for entry in selected_context
-        if entry.get("slide_number") is not None
+        if isinstance(entry.get("slide_number"), int)
     ]
     context_text = _build_slide_context(selected_context)
-    conversation_text = _build_conversation_text()
+    conversation_text = _build_conversation_text(current_session_id)
 
     try:
         answer = answer_question_with_context(
@@ -555,10 +593,19 @@ async def ask_question(payload: QuestionRequest) -> dict[str, object]:
             detail=f"Failed to generate answer: {exc}",
         ) from exc
 
-    _record_conversation(question, answer, slide_number)
+    _record_conversation(current_session_id, question, answer, slide_number)
+    log_qa_turn(
+        session_id=current_session_id,
+        slide_number=slide_number if isinstance(slide_number, int) else None,
+        question=question,
+        answer=answer,
+        relevance=relevance,
+        matched_slides=matched_slides,
+    )
     return {
         "answer": answer,
         "slide_number": slide_number,
         "relevance": relevance,
         "matched_slides": matched_slides,
+        "session_id": current_session_id,
     }
