@@ -14,12 +14,14 @@ flowchart TD
     E --> F
     F -- No --> G[Return cached summary]
     F -- Yes --> H[Gemini structured summary]
-    H --> I[Slide history]
-    I --> J[Voice Q&A context]
+    H --> I[SQLite session store]
+    I --> J[Relevant slide retrieval]
     J --> K[LLM answer + TTS]
 ```
 
 ## Increment 1: Lecture Memory Retrieval
+
+Status: Implemented.
 
 Goal: answer questions using the most relevant slides from the lecture, not only the latest slide window.
 
@@ -38,14 +40,16 @@ Why this matters:
 
 ## Increment 2: Persistent Session Store
 
+Status: Implemented with SQLite.
+
 Goal: separate lecture/session state from process memory.
 
-Implementation idea:
+Implemented:
 
-- Introduce a session ID for each capture session.
-- Move slide history from local JSON files to Redis or SQLite.
-- Store slide fingerprints, summaries, OCR text, and timestamps per session.
-- Add cleanup/expiration for old sessions.
+- Added `session_id` support to `/process_slide` and `/ask`.
+- Added SQLite tables for `sessions`, `session_states`, `slides`, and `qa_turns`.
+- Stored slide summaries, OCR text, similarity metrics, and QA history per session.
+- Kept backward compatibility by using a `default` session when clients do not send `session_id`.
 
 Why this matters:
 
