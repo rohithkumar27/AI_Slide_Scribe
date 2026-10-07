@@ -61,6 +61,8 @@ QUESTION_RELEVANCE_THRESHOLD = float(
 )
 MAX_SLIDE_CONTEXT = int(os.getenv("SLIDE_CONTEXT_LIMIT", "5"))
 MAX_CONVERSATION_MEMORY = int(os.getenv("CONVERSATION_MEMORY_LIMIT", "5"))
+RETRIEVAL_CONTEXT_LIMIT = int(os.getenv("RETRIEVAL_CONTEXT_LIMIT", "3"))
+RECENT_CONTEXT_FALLBACK = int(os.getenv("RECENT_CONTEXT_FALLBACK", "2"))
 
 # Extremely small sets to keep obvious off-topic queries from being answered.
 # Anything not matching these will be treated as related enough to proceed.
@@ -168,22 +170,91 @@ def _topic_hint(summary: Optional[Dict[str, Any]]) -> str:
     return ""
 
 
-def _build_slide_context(history: List[Dict[str, Any]], limit: int) -> str:
-    if not history:
+def _slide_text(entry: Dict[str, Any]) -> str:
+    summary = entry.get("summary", {}) or {}
+    parts = [json.dumps(summary, ensure_ascii=False)]
+    ocr_text = entry.get("ocr_text")
+    if ocr_text:
+        parts.append(str(ocr_text))
+    return "\n".join(parts)
+
+
+def _build_slide_context(entries: List[Dict[str, Any]], limit: Optional[int] = None) -> str:
+    if not entries:
         return ""
-    selected = history[-limit:]
+    selected = entries[-limit:] if limit is not None and limit > 0 else entries
     parts: List[str] = []
     for entry in selected:
         summary_blob = json.dumps(entry.get("summary", {}), ensure_ascii=False)
+        ocr_text = entry.get("ocr_text")
+        if ocr_text:
+            summary_blob = f"{summary_blob}\nOCR text: {ocr_text}"
         parts.append(
             f"Slide {entry.get('slide_number', '?')} (captured at {entry.get('timestamp', 'unknown')}):\n{summary_blob}"
         )
     return "\n\n".join(parts)
 
 
+def _score_slide_for_question(question: str, entry: Dict[str, Any]) -> float:
+    slide_text = _slide_text(entry)
+    if not slide_text.strip():
+        return 0.0
+
+    question_tokens = _question_tokens(question)
+    slide_tokens = _question_tokens(slide_text)
+    if not question_tokens or not slide_tokens:
+        return 0.0
+
+    overlap = len(question_tokens & slide_tokens) / max(len(question_tokens), 1)
+    fuzzy_score = token_sort_ratio(question, slide_text[:2500]) / 100.0
+    return (0.70 * overlap) + (0.30 * fuzzy_score)
+
+
+def _select_relevant_slide_context(
+    question: str,
+    history: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not history:
+        return []
+
+    scored = [
+        (_score_slide_for_question(question, entry), index, entry)
+        for index, entry in enumerate(history)
+    ]
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
+    selected: List[Dict[str, Any]] = []
+    seen_numbers: set[int] = set()
+
+    for score, _, entry in scored[:RETRIEVAL_CONTEXT_LIMIT]:
+        if score <= 0:
+            continue
+        slide_number = entry.get("slide_number")
+        if isinstance(slide_number, int):
+            seen_numbers.add(slide_number)
+        selected.append(entry)
+
+    for entry in history[-RECENT_CONTEXT_FALLBACK:]:
+        slide_number = entry.get("slide_number")
+        if isinstance(slide_number, int) and slide_number in seen_numbers:
+            continue
+        selected.append(entry)
+        if isinstance(slide_number, int):
+            seen_numbers.add(slide_number)
+
+    if not selected:
+        selected = history[-MAX_SLIDE_CONTEXT:]
+
+    return sorted(
+        selected,
+        key=lambda entry: entry.get("slide_number", 0),
+    )[-MAX_SLIDE_CONTEXT:]
+
+
 def _append_slide_history_entry(
     summary: Dict[str, Any],
     *,
+    ocr_text: str,
     text_similarity: Optional[float],
     clip_cosine: Optional[float],
 ) -> Dict[str, Any]:
@@ -193,6 +264,7 @@ def _append_slide_history_entry(
         "slide_number": slide_number,
         "timestamp": datetime.utcnow().isoformat(),
         "summary": summary,
+        "ocr_text": ocr_text,
         "metrics": {
             "text_similarity": text_similarity,
             "clip_cosine": clip_cosine,
@@ -333,6 +405,7 @@ async def process_slide(image: UploadFile = File(...)) -> ProcessSlideResponse:
         if summary_payload is not None:
             history_entry = _append_slide_history_entry(
                 summary_payload,
+                ocr_text=sample.ocr_text,
                 text_similarity=text_similarity,
                 clip_cosine=clip_cosine,
             )
@@ -460,7 +533,13 @@ async def ask_question(payload: QuestionRequest) -> dict[str, object]:
                 question,
             )
 
-    context_text = _build_slide_context(history, MAX_SLIDE_CONTEXT)
+    selected_context = _select_relevant_slide_context(question, history)
+    matched_slides = [
+        entry.get("slide_number")
+        for entry in selected_context
+        if entry.get("slide_number") is not None
+    ]
+    context_text = _build_slide_context(selected_context)
     conversation_text = _build_conversation_text()
 
     try:
@@ -481,4 +560,5 @@ async def ask_question(payload: QuestionRequest) -> dict[str, object]:
         "answer": answer,
         "slide_number": slide_number,
         "relevance": relevance,
+        "matched_slides": matched_slides,
     }
